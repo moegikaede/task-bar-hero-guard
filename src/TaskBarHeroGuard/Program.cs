@@ -40,6 +40,12 @@ namespace TaskBarHeroGuard
         private DateTime _nextRestartAllowedUtc = DateTime.MinValue;
         private long _lastObservedBytes;
         private DateTime _lastObservedUtc = DateTime.MinValue;
+        private bool _restartPending;
+        private string _pendingReason = "";
+        private DateTime _pendingSinceUtc = DateTime.MinValue;
+        private long _pendingLogPosition;
+        private DateTime _pendingSaveWriteUtc = DateTime.MinValue;
+        private DateTime _stageSignalSeenUtc = DateTime.MinValue;
 
         public GuardContext(string[] args)
         {
@@ -94,11 +100,12 @@ namespace TaskBarHeroGuard
         {
             _config = GuardConfig.Load(_args);
             _timer.Interval = Math.Max(1000, _config.CheckIntervalSeconds * 1000);
+            ResetPendingRestart();
             UpdateTrayText("config reloaded");
 
             if (showBalloon)
             {
-                ShowBalloon("Config reloaded", "Limit: " + FormatBytes(_config.ThresholdBytes));
+                ShowBalloon("Config reloaded", "Limit: " + FormatBytes(_config.ThresholdBytes) + " / Hard: " + FormatBytes(_config.HardThresholdBytes));
             }
         }
 
@@ -111,6 +118,7 @@ namespace TaskBarHeroGuard
                 {
                     _lastObservedBytes = 0;
                     _lastObservedUtc = DateTime.UtcNow;
+                    ResetPendingRestart();
                     UpdateTrayText("not running");
                     if (_config.AutoLaunchWhenMissing)
                     {
@@ -140,11 +148,32 @@ namespace TaskBarHeroGuard
 
                 _lastObservedBytes = totalBytes;
                 _lastObservedUtc = DateTime.UtcNow;
+
+                if (_restartPending)
+                {
+                    EvaluatePendingRestart(maxBytes);
+                    return;
+                }
+
                 UpdateTrayText("monitoring");
+
+                if (maxBytes >= _config.HardThresholdBytes)
+                {
+                    RestartGame("Hard memory limit exceeded: " + FormatBytes(maxBytes));
+                    return;
+                }
 
                 if (maxBytes >= _config.ThresholdBytes)
                 {
-                    RestartGame("Memory limit exceeded: " + FormatBytes(maxBytes));
+                    if (_config.WaitForStageLog)
+                    {
+                        BeginPendingRestart("Memory limit exceeded: " + FormatBytes(maxBytes));
+                    }
+                    else
+                    {
+                        RestartGame("Memory limit exceeded: " + FormatBytes(maxBytes));
+                    }
+
                     return;
                 }
 
@@ -157,6 +186,147 @@ namespace TaskBarHeroGuard
             {
                 UpdateTrayText("monitor error");
                 ShowBalloon("Monitor error", ex.Message);
+            }
+        }
+
+        private void BeginPendingRestart(string reason)
+        {
+            _restartPending = true;
+            _pendingReason = reason;
+            _pendingSinceUtc = DateTime.UtcNow;
+            _pendingLogPosition = GetFileLength(_config.PlayerLogPath);
+            _pendingSaveWriteUtc = GetLastWriteUtc(_config.SaveFilePath);
+            _stageSignalSeenUtc = DateTime.MinValue;
+
+            UpdateTrayText("restart pending");
+            ShowBalloon("Restart pending", "Waiting for stage log. " + reason);
+        }
+
+        private void EvaluatePendingRestart(long maxBytes)
+        {
+            DateTime now = DateTime.UtcNow;
+            UpdateTrayText("restart pending");
+
+            if (maxBytes >= _config.HardThresholdBytes)
+            {
+                RestartGame("Hard memory limit exceeded while pending: " + FormatBytes(maxBytes));
+                return;
+            }
+
+            if ((now - _pendingSinceUtc).TotalSeconds >= _config.MaxDeferralSeconds)
+            {
+                RestartGame("Max deferral reached. " + _pendingReason);
+                return;
+            }
+
+            if (_stageSignalSeenUtc == DateTime.MinValue && TryConsumeStageSignal())
+            {
+                _stageSignalSeenUtc = now;
+            }
+
+            if (_stageSignalSeenUtc == DateTime.MinValue)
+            {
+                return;
+            }
+
+            DateTime saveWriteUtc = GetLastWriteUtc(_config.SaveFilePath);
+            bool saveUpdated = saveWriteUtc > _pendingSaveWriteUtc;
+            bool signalSettled = (now - _stageSignalSeenUtc).TotalSeconds >= _config.StageSignalSettleSeconds;
+            bool saveSettled = saveUpdated && (now - saveWriteUtc).TotalSeconds >= _config.SaveSettleSeconds;
+
+            if ((_config.RequireSaveUpdate && saveSettled) || (!_config.RequireSaveUpdate && signalSettled))
+            {
+                RestartGame("Stage completion signal detected. " + _pendingReason);
+            }
+        }
+
+        private bool TryConsumeStageSignal()
+        {
+            string chunk = ReadLogChunk(_config.PlayerLogPath, ref _pendingLogPosition, _config.MaxLogReadBytes);
+            if (chunk.Length == 0)
+            {
+                return false;
+            }
+
+            return chunk.IndexOf(_config.StageLogSignalText1, StringComparison.Ordinal) >= 0
+                && chunk.IndexOf(_config.StageLogSignalText2, StringComparison.Ordinal) >= 0;
+        }
+
+        private void ResetPendingRestart()
+        {
+            _restartPending = false;
+            _pendingReason = "";
+            _pendingSinceUtc = DateTime.MinValue;
+            _pendingLogPosition = GetFileLength(_config.PlayerLogPath);
+            _pendingSaveWriteUtc = GetLastWriteUtc(_config.SaveFilePath);
+            _stageSignalSeenUtc = DateTime.MinValue;
+        }
+
+        private static long GetFileLength(string path)
+        {
+            try
+            {
+                var file = new FileInfo(path);
+                return file.Exists ? file.Length : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static DateTime GetLastWriteUtc(string path)
+        {
+            try
+            {
+                return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+            }
+            catch
+            {
+                return DateTime.MinValue;
+            }
+        }
+
+        private static string ReadLogChunk(string path, ref long position, int maxBytes)
+        {
+            try
+            {
+                var file = new FileInfo(path);
+                if (!file.Exists)
+                {
+                    position = 0;
+                    return "";
+                }
+
+                if (file.Length < position)
+                {
+                    position = 0;
+                }
+
+                long available = file.Length - position;
+                if (available <= 0)
+                {
+                    return "";
+                }
+
+                if (available > maxBytes)
+                {
+                    position = file.Length - maxBytes;
+                    available = maxBytes;
+                }
+
+                byte[] bytes = new byte[available];
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    stream.Position = position;
+                    int read = stream.Read(bytes, 0, bytes.Length);
+                    position = stream.Position;
+                    return System.Text.Encoding.UTF8.GetString(bytes, 0, read);
+                }
+            }
+            catch
+            {
+                return "";
             }
         }
 
@@ -188,6 +358,7 @@ namespace TaskBarHeroGuard
             }
 
             _nextRestartAllowedUtc = now.AddSeconds(_config.RestartCooldownSeconds);
+            ResetPendingRestart();
             UpdateTrayText("restarting");
             ShowBalloon("Restarting Task Bar Hero", reason);
 
@@ -276,7 +447,7 @@ namespace TaskBarHeroGuard
         {
             string observed = _lastObservedUtc == DateTime.MinValue ? "-" : FormatBytes(_lastObservedBytes);
             _statusItem.Text = "Status: " + state + " / Current: " + observed;
-            _thresholdItem.Text = "Limit: " + FormatBytes(_config.ThresholdBytes) + " / Interval: " + _config.CheckIntervalSeconds + "s";
+            _thresholdItem.Text = "Limit: " + FormatBytes(_config.ThresholdBytes) + " / Hard: " + FormatBytes(_config.HardThresholdBytes);
 
             string text = "Task Bar Hero Guard - " + state;
             if (text.Length > 63)
@@ -327,11 +498,23 @@ namespace TaskBarHeroGuard
         public string ProcessName = "TaskBarHero.exe";
         public string LaunchUri = "steam://rungameid/3678970";
         public long ThresholdBytes = DefaultThresholdBytes;
+        public long HardThresholdBytes = 1536L * 1024L * 1024L;
         public int CheckIntervalSeconds = 10;
         public int RestartDelaySeconds = 8;
         public int RestartCooldownSeconds = 120;
         public int GracefulCloseSeconds = 10;
         public bool AutoLaunchWhenMissing = false;
+        public bool WaitForStageLog = true;
+        public string GameDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).Replace("\\Local", "\\LocalLow"), "TesseractStudio", "TaskbarHero");
+        public string PlayerLogPath = "";
+        public string SaveFilePath = "";
+        public string StageLogSignalText1 = "TaskbarHero.Log.LogManager:kil(LogData)";
+        public string StageLogSignalText2 = "TaskbarHero.StageManager:ihl(Int32)";
+        public int MaxDeferralSeconds = 1800;
+        public int StageSignalSettleSeconds = 5;
+        public int SaveSettleSeconds = 5;
+        public bool RequireSaveUpdate = true;
+        public int MaxLogReadBytes = 1048576;
 
         public static GuardConfig Load(string[] args)
         {
@@ -361,21 +544,79 @@ namespace TaskBarHeroGuard
 
         private static void EnsureConfigFile()
         {
+            KeyValuePair<string, string>[] defaults = DefaultConfigPairs();
             if (File.Exists(ConfigPath))
+            {
+                AppendMissingConfigKeys(defaults);
+                return;
+            }
+
+            File.WriteAllText(ConfigPath, BuildDefaultConfig(defaults));
+        }
+
+        private static KeyValuePair<string, string>[] DefaultConfigPairs()
+        {
+            return new KeyValuePair<string, string>[]
+            {
+                new KeyValuePair<string, string>("ProcessName", "TaskBarHero.exe"),
+                new KeyValuePair<string, string>("LaunchUri", "steam://rungameid/3678970"),
+                new KeyValuePair<string, string>("ThresholdMB", "1024"),
+                new KeyValuePair<string, string>("HardThresholdMB", "1536"),
+                new KeyValuePair<string, string>("CheckIntervalSeconds", "10"),
+                new KeyValuePair<string, string>("RestartDelaySeconds", "8"),
+                new KeyValuePair<string, string>("RestartCooldownSeconds", "120"),
+                new KeyValuePair<string, string>("GracefulCloseSeconds", "10"),
+                new KeyValuePair<string, string>("AutoLaunchWhenMissing", "false"),
+                new KeyValuePair<string, string>("WaitForStageLog", "true"),
+                new KeyValuePair<string, string>("GameDataPath", "%USERPROFILE%\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero"),
+                new KeyValuePair<string, string>("PlayerLogPath", ""),
+                new KeyValuePair<string, string>("SaveFilePath", ""),
+                new KeyValuePair<string, string>("StageLogSignalText1", "TaskbarHero.Log.LogManager:kil(LogData)"),
+                new KeyValuePair<string, string>("StageLogSignalText2", "TaskbarHero.StageManager:ihl(Int32)"),
+                new KeyValuePair<string, string>("MaxDeferralSeconds", "1800"),
+                new KeyValuePair<string, string>("StageSignalSettleSeconds", "5"),
+                new KeyValuePair<string, string>("SaveSettleSeconds", "5"),
+                new KeyValuePair<string, string>("RequireSaveUpdate", "true"),
+                new KeyValuePair<string, string>("MaxLogReadBytes", "1048576")
+            };
+        }
+
+        private static string BuildDefaultConfig(KeyValuePair<string, string>[] defaults)
+        {
+            var text = new System.Text.StringBuilder();
+            text.Append("# Task Bar Hero Guard settings\r\n");
+            foreach (KeyValuePair<string, string> pair in defaults)
+            {
+                text.Append(pair.Key).Append("=").Append(pair.Value).Append("\r\n");
+            }
+
+            return text.ToString();
+        }
+
+        private static void AppendMissingConfigKeys(KeyValuePair<string, string>[] defaults)
+        {
+            var existing = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, string> pair in ReadPairs(ConfigPath))
+            {
+                existing[pair.Key] = true;
+            }
+
+            var missing = new System.Text.StringBuilder();
+            foreach (KeyValuePair<string, string> pair in defaults)
+            {
+                if (!existing.ContainsKey(pair.Key))
+                {
+                    missing.Append(pair.Key).Append("=").Append(pair.Value).Append("\r\n");
+                }
+            }
+
+            if (missing.Length == 0)
             {
                 return;
             }
 
-            File.WriteAllText(ConfigPath,
-                "# Task Bar Hero Guard settings\r\n" +
-                "ProcessName=TaskBarHero.exe\r\n" +
-                "LaunchUri=steam://rungameid/3678970\r\n" +
-                "ThresholdMB=1024\r\n" +
-                "CheckIntervalSeconds=10\r\n" +
-                "RestartDelaySeconds=8\r\n" +
-                "RestartCooldownSeconds=120\r\n" +
-                "GracefulCloseSeconds=10\r\n" +
-                "AutoLaunchWhenMissing=false\r\n");
+            string prefix = File.ReadAllText(ConfigPath).EndsWith("\n") ? "" : "\r\n";
+            File.AppendAllText(ConfigPath, prefix + "\r\n# Added by newer Task Bar Hero Guard\r\n" + missing);
         }
 
         private static IEnumerable<KeyValuePair<string, string>> ReadPairs(string path)
@@ -417,6 +658,14 @@ namespace TaskBarHeroGuard
             {
                 ThresholdBytes = ParseLong(value, DefaultThresholdBytes);
             }
+            else if (normalizedKey == "hardthresholdmb")
+            {
+                HardThresholdBytes = ParseLong(value, 1536) * 1024L * 1024L;
+            }
+            else if (normalizedKey == "hardthresholdbytes")
+            {
+                HardThresholdBytes = ParseLong(value, HardThresholdBytes);
+            }
             else if (normalizedKey == "checkintervalseconds" || normalizedKey == "interval")
             {
                 CheckIntervalSeconds = ParseInt(value, CheckIntervalSeconds);
@@ -437,6 +686,50 @@ namespace TaskBarHeroGuard
             {
                 AutoLaunchWhenMissing = ParseBool(value, AutoLaunchWhenMissing);
             }
+            else if (normalizedKey == "waitforstagelog")
+            {
+                WaitForStageLog = ParseBool(value, WaitForStageLog);
+            }
+            else if (normalizedKey == "gamedatapath")
+            {
+                GameDataPath = ExpandPath(value);
+            }
+            else if (normalizedKey == "playerlogpath")
+            {
+                PlayerLogPath = ExpandPath(value);
+            }
+            else if (normalizedKey == "savefilepath")
+            {
+                SaveFilePath = ExpandPath(value);
+            }
+            else if (normalizedKey == "stagelogsignaltext1")
+            {
+                StageLogSignalText1 = value;
+            }
+            else if (normalizedKey == "stagelogsignaltext2")
+            {
+                StageLogSignalText2 = value;
+            }
+            else if (normalizedKey == "maxdeferralseconds")
+            {
+                MaxDeferralSeconds = ParseInt(value, MaxDeferralSeconds);
+            }
+            else if (normalizedKey == "stagesignalsettleseconds")
+            {
+                StageSignalSettleSeconds = ParseInt(value, StageSignalSettleSeconds);
+            }
+            else if (normalizedKey == "savesettleseconds")
+            {
+                SaveSettleSeconds = ParseInt(value, SaveSettleSeconds);
+            }
+            else if (normalizedKey == "requiresaveupdate")
+            {
+                RequireSaveUpdate = ParseBool(value, RequireSaveUpdate);
+            }
+            else if (normalizedKey == "maxlogreadbytes")
+            {
+                MaxLogReadBytes = ParseInt(value, MaxLogReadBytes);
+            }
         }
 
         private void Normalize()
@@ -456,10 +749,35 @@ namespace TaskBarHeroGuard
                 ThresholdBytes = DefaultThresholdBytes;
             }
 
+            if (HardThresholdBytes <= ThresholdBytes)
+            {
+                HardThresholdBytes = ThresholdBytes + 512L * 1024L * 1024L;
+            }
+
+            GameDataPath = ExpandPath(GameDataPath);
+            if (string.IsNullOrWhiteSpace(PlayerLogPath))
+            {
+                PlayerLogPath = Path.Combine(GameDataPath, "Player.log");
+            }
+
+            if (string.IsNullOrWhiteSpace(SaveFilePath))
+            {
+                SaveFilePath = Path.Combine(GameDataPath, "SaveFile_Live.es3");
+            }
+
             CheckIntervalSeconds = Clamp(CheckIntervalSeconds, 1, 3600);
             RestartDelaySeconds = Clamp(RestartDelaySeconds, 1, 300);
             RestartCooldownSeconds = Clamp(RestartCooldownSeconds, 10, 3600);
             GracefulCloseSeconds = Clamp(GracefulCloseSeconds, 0, 300);
+            MaxDeferralSeconds = Clamp(MaxDeferralSeconds, 10, 86400);
+            StageSignalSettleSeconds = Clamp(StageSignalSettleSeconds, 0, 3600);
+            SaveSettleSeconds = Clamp(SaveSettleSeconds, 0, 3600);
+            MaxLogReadBytes = Clamp(MaxLogReadBytes, 4096, 16 * 1024 * 1024);
+        }
+
+        private static string ExpandPath(string value)
+        {
+            return Environment.ExpandEnvironmentVariables(value ?? "").Trim();
         }
 
         private static long ParseLong(string value, long fallback)
