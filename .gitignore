@@ -1,0 +1,5 @@
+dist/*.ini
+*.user
+*.suo
+bin/
+obj/
