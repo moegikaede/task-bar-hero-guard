@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -34,6 +36,7 @@ namespace TaskBarHeroGuard
         private readonly string[] _args;
         private readonly NotifyIcon _notifyIcon;
         private readonly System.Windows.Forms.Timer _timer;
+        private readonly System.Windows.Forms.Timer _startupWindowTimer;
         private readonly ToolStripMenuItem _statusItem;
         private readonly ToolStripMenuItem _thresholdItem;
         private GuardConfig _config;
@@ -46,6 +49,33 @@ namespace TaskBarHeroGuard
         private long _pendingLogPosition;
         private DateTime _pendingSaveWriteUtc = DateTime.MinValue;
         private DateTime _stageSignalSeenUtc = DateTime.MinValue;
+        private DateTime _sendStartupWindowToBackUntilUtc = DateTime.MinValue;
+        private DateTime _bringGameToFrontUntilUtc = DateTime.MinValue;
+        private DateTime _bringGameToFrontRetryUntilUtc = DateTime.MinValue;
+        private DateTime _autoCloseOfflineRewardUntilUtc = DateTime.MinValue;
+        private DateTime _nextAutoCloseOfflineRewardCheckUtc = DateTime.MinValue;
+        private long _stageStartLogPosition;
+        private bool _startupWindowMoved;
+        private bool _waitingForStageStartToFront;
+        private bool _retryBringGameToFront;
+        private bool _autoCloseOfflineReward;
+        private bool _targetWasRunning;
+        private DateTime _lastStartupHandlingUtc = DateTime.MinValue;
+
+        private static readonly IntPtr HwndTop = new IntPtr(0);
+        private static readonly IntPtr HwndBottom = new IntPtr(1);
+        private static readonly IntPtr HwndTopMost = new IntPtr(-1);
+        private static readonly IntPtr HwndNoTopMost = new IntPtr(-2);
+        private const uint SwpNoSize = 0x0001;
+        private const uint SwpNoMove = 0x0002;
+        private const uint SwpNoActivate = 0x0010;
+        private const uint SwpNoOwnerZOrder = 0x0200;
+        private const int SwRestore = 9;
+        private const int WmLButtonDown = 0x0201;
+        private const int WmLButtonUp = 0x0202;
+        private const int MkLButton = 0x0001;
+        private const uint MouseEventLeftDown = 0x0002;
+        private const uint MouseEventLeftUp = 0x0004;
 
         public GuardContext(string[] args)
         {
@@ -62,9 +92,10 @@ namespace TaskBarHeroGuard
             menu.Items.Add(_statusItem);
             menu.Items.Add(_thresholdItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Check now", null, delegate { CheckOnce(true); });
             menu.Items.Add("Launch Task Bar Hero", null, delegate { LaunchGame(); });
-            menu.Items.Add("Restart Task Bar Hero", null, delegate { RestartGame("Manual restart"); });
+            menu.Items.Add("Send startup windows to back", null, delegate { SendStartupWindowsToBack(true); });
+            menu.Items.Add("Bring Task Bar Hero to front", null, delegate { BringGameWindowsToFront(true); });
+            menu.Items.Add("Restart Task Bar Hero", null, delegate { RestartGame("Manual restart", true); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Open config", null, delegate { OpenConfigFile(); });
             menu.Items.Add("Reload config", null, delegate { ReloadConfig(true); });
@@ -83,6 +114,10 @@ namespace TaskBarHeroGuard
             _timer.Tick += delegate { CheckOnce(false); };
             _timer.Start();
 
+            _startupWindowTimer = new System.Windows.Forms.Timer();
+            _startupWindowTimer.Interval = 500;
+            _startupWindowTimer.Tick += delegate { TickStartupWindowBack(); };
+
             UpdateTrayText("monitoring");
             CheckOnce(false);
         }
@@ -90,8 +125,10 @@ namespace TaskBarHeroGuard
         protected override void ExitThreadCore()
         {
             _timer.Stop();
+            _startupWindowTimer.Stop();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
+            _startupWindowTimer.Dispose();
             _timer.Dispose();
             base.ExitThreadCore();
         }
@@ -116,6 +153,7 @@ namespace TaskBarHeroGuard
                 Process[] processes = GetTargetProcesses();
                 if (processes.Length == 0)
                 {
+                    _targetWasRunning = false;
                     _lastObservedBytes = 0;
                     _lastObservedUtc = DateTime.UtcNow;
                     ResetPendingRestart();
@@ -129,6 +167,12 @@ namespace TaskBarHeroGuard
                         ShowBalloon("Task Bar Hero is not running", "Launch is available from tray menu.");
                     }
                     return;
+                }
+
+                if (!_targetWasRunning)
+                {
+                    _targetWasRunning = true;
+                    BeginStartupWindowHandling();
                 }
 
                 long totalBytes = 0;
@@ -275,6 +319,24 @@ namespace TaskBarHeroGuard
             }
         }
 
+        private static long GetRecentFileStartPosition(string path, int maxBytes)
+        {
+            try
+            {
+                var file = new FileInfo(path);
+                if (!file.Exists)
+                {
+                    return 0;
+                }
+
+                return Math.Max(0, file.Length - Math.Max(4096, maxBytes));
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
         private static DateTime GetLastWriteUtc(string path)
         {
             try
@@ -351,8 +413,13 @@ namespace TaskBarHeroGuard
 
         private void RestartGame(string reason)
         {
+            RestartGame(reason, false);
+        }
+
+        private void RestartGame(string reason, bool ignoreCooldown)
+        {
             DateTime now = DateTime.UtcNow;
-            if (now < _nextRestartAllowedUtc)
+            if (!ignoreCooldown && now < _nextRestartAllowedUtc)
             {
                 return;
             }
@@ -418,6 +485,7 @@ namespace TaskBarHeroGuard
                 startInfo.FileName = _config.LaunchUri;
                 startInfo.UseShellExecute = true;
                 Process.Start(startInfo);
+                BeginStartupWindowHandling();
                 UpdateTrayText("launch requested");
             }
             catch (Exception ex)
@@ -425,6 +493,742 @@ namespace TaskBarHeroGuard
                 UpdateTrayText("launch failed");
                 ShowBalloon("Task Bar Hero launch failed", ex.Message);
             }
+        }
+
+        private void BeginStartupWindowHandling()
+        {
+            DateTime now = DateTime.UtcNow;
+            if ((now - _lastStartupHandlingUtc).TotalSeconds < 3)
+            {
+                return;
+            }
+
+            _lastStartupHandlingUtc = now;
+            _startupWindowMoved = false;
+            _waitingForStageStartToFront = _config.BringGameToFrontOnStageStart;
+            _retryBringGameToFront = false;
+            _autoCloseOfflineReward = _config.AutoCloseOfflineReward;
+            _stageStartLogPosition = GetRecentFileStartPosition(_config.PlayerLogPath, _config.MaxLogReadBytes);
+            _sendStartupWindowToBackUntilUtc = _config.SendStartupWindowToBack
+                ? DateTime.UtcNow.AddSeconds(_config.StartupWindowBackDurationSeconds)
+                : DateTime.MinValue;
+            _bringGameToFrontUntilUtc = _config.BringGameToFrontOnStageStart
+                ? DateTime.UtcNow.AddSeconds(_config.StageStartFrontWaitSeconds)
+                : DateTime.MinValue;
+            _nextAutoCloseOfflineRewardCheckUtc = _config.AutoCloseOfflineReward
+                ? DateTime.UtcNow.AddSeconds(_config.AutoCloseOfflineRewardDelaySeconds)
+                : DateTime.MinValue;
+            _autoCloseOfflineRewardUntilUtc = _config.AutoCloseOfflineReward
+                ? _nextAutoCloseOfflineRewardCheckUtc.AddSeconds(_config.AutoCloseOfflineRewardDurationSeconds)
+                : DateTime.MinValue;
+
+            if ((_config.SendStartupWindowToBack || _config.BringGameToFrontOnStageStart || _config.AutoCloseOfflineReward) && !_startupWindowTimer.Enabled)
+            {
+                _startupWindowTimer.Start();
+            }
+        }
+
+        private void TickStartupWindowBack()
+        {
+            DateTime now = DateTime.UtcNow;
+
+            if (_config.SendStartupWindowToBack && now <= _sendStartupWindowToBackUntilUtc)
+            {
+                SendStartupWindowsToBack(false);
+            }
+
+            if (_waitingForStageStartToFront)
+            {
+                if (now > _bringGameToFrontUntilUtc)
+                {
+                    _waitingForStageStartToFront = false;
+                }
+                else if (TryConsumeStageStartSignal())
+                {
+                    _waitingForStageStartToFront = false;
+                    StopStartupWindowBack();
+                    BeginBringGameToFrontRetry();
+                }
+            }
+
+            if (_retryBringGameToFront)
+            {
+                if (now > _bringGameToFrontRetryUntilUtc)
+                {
+                    _retryBringGameToFront = false;
+                }
+                else
+                {
+                    BringGameWindowsToFront(false);
+                }
+            }
+
+            if (_autoCloseOfflineReward)
+            {
+                if (now > _autoCloseOfflineRewardUntilUtc)
+                {
+                    StopAutoCloseOfflineReward();
+                }
+                else if (now >= _nextAutoCloseOfflineRewardCheckUtc)
+                {
+                    if (TryAutoCloseOfflineReward())
+                    {
+                        StopAutoCloseOfflineReward();
+                    }
+                    else
+                    {
+                        _nextAutoCloseOfflineRewardCheckUtc = now.AddMilliseconds(_config.AutoCloseOfflineRewardIntervalMilliseconds);
+                    }
+                }
+            }
+
+            if (now > _sendStartupWindowToBackUntilUtc && !_waitingForStageStartToFront && !_retryBringGameToFront && !_autoCloseOfflineReward)
+            {
+                _startupWindowTimer.Stop();
+                if (_startupWindowMoved)
+                {
+                    UpdateTrayText("monitoring");
+                }
+            }
+        }
+
+        private void BeginBringGameToFrontRetry()
+        {
+            _retryBringGameToFront = true;
+            _bringGameToFrontRetryUntilUtc = DateTime.UtcNow.AddSeconds(_config.StageStartFrontRetrySeconds);
+            BringGameWindowsToFront(false);
+        }
+
+        private void StopStartupWindowBack()
+        {
+            _sendStartupWindowToBackUntilUtc = DateTime.MinValue;
+            _startupWindowMoved = false;
+        }
+
+        private void StopAutoCloseOfflineReward()
+        {
+            _autoCloseOfflineReward = false;
+            _autoCloseOfflineRewardUntilUtc = DateTime.MinValue;
+            _nextAutoCloseOfflineRewardCheckUtc = DateTime.MinValue;
+        }
+
+        private bool TryConsumeStageStartSignal()
+        {
+            string chunk = ReadLogChunk(_config.PlayerLogPath, ref _stageStartLogPosition, _config.MaxLogReadBytes);
+            if (chunk.Length == 0)
+            {
+                return false;
+            }
+
+            return ContainsSignal(chunk, _config.StageStartLogSignalText1, _config.StageStartLogSignalText2);
+        }
+
+        private static bool ContainsSignal(string chunk, string signal1, string signal2)
+        {
+            if (string.IsNullOrEmpty(signal1) || chunk.IndexOf(signal1, StringComparison.Ordinal) < 0)
+            {
+                return false;
+            }
+
+            return string.IsNullOrEmpty(signal2) || chunk.IndexOf(signal2, StringComparison.Ordinal) >= 0;
+        }
+
+        private void SendStartupWindowsToBack(bool showBalloon)
+        {
+            int moved = 0;
+
+            moved += MoveWindowsForProcessNamesToBack(new string[] { _config.ProcessName }, new string[0], false);
+            moved += MoveWindowsForProcessNamesToBack(SplitConfigList(_config.StartupBackProcessNames), SplitConfigList(_config.StartupBackWindowTitleContains), _config.StartupBackRequireTitleMatch);
+
+            if (moved > 0)
+            {
+                _startupWindowMoved = true;
+                UpdateTrayText("startup windows sent to back");
+            }
+            else if (showBalloon)
+            {
+                ShowBalloon("Startup window not found", "No visible game or Steam launch window is ready yet.");
+            }
+        }
+
+        private void BringGameWindowsToFront(bool showBalloon)
+        {
+            StopStartupWindowBack();
+            int moved = MoveWindowsForProcessNamesToFront(new string[] { _config.ProcessName }, new string[0], false);
+            if (moved > 0)
+            {
+                UpdateTrayText("game brought to front");
+            }
+            else if (showBalloon)
+            {
+                ShowBalloon("Task Bar Hero window not found", "No visible game window is ready yet.");
+            }
+        }
+
+        private bool TryAutoCloseOfflineReward()
+        {
+            IntPtr hWnd = FindProcessWindow(_config.ProcessName, "UnityWndClass");
+            if (hWnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            Point clickPoint;
+            using (Bitmap image = CaptureWindow(hWnd))
+            {
+                if (image == null || !TryFindOfflineRewardCloseButton(image, out clickPoint))
+                {
+                    return false;
+                }
+            }
+
+            bool clicked = TryRealClick(hWnd, clickPoint.X, clickPoint.Y);
+            if (clicked)
+            {
+                UpdateTrayText("offline reward closed");
+            }
+
+            return clicked;
+        }
+
+        private static int MoveWindowsForProcessNamesToBack(string[] processNames, string[] titleTokens, bool requireTitleMatch)
+        {
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, true);
+        }
+
+        private static int MoveWindowsForProcessNamesToFront(string[] processNames, string[] titleTokens, bool requireTitleMatch)
+        {
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, false);
+        }
+
+        private static int MoveWindowsForProcessNames(string[] processNames, string[] titleTokens, bool requireTitleMatch, bool toBack)
+        {
+            WindowMatchState state = new WindowMatchState();
+            state.ProcessNames = BuildProcessNameSet(processNames);
+            state.TitleTokens = titleTokens;
+            state.RequireTitleMatch = requireTitleMatch;
+            state.ToBack = toBack;
+            state.Moved = 0;
+
+            if (state.ProcessNames.Count == 0)
+            {
+                return 0;
+            }
+
+            foreach (string processName in state.ProcessNames.Keys)
+            {
+                Process[] processes;
+                try
+                {
+                    processes = Process.GetProcessesByName(processName);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (Process process in processes)
+                {
+                    using (process)
+                    {
+                        try
+                        {
+                            int targetProcessId = process.Id;
+                            EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+                            {
+                                int windowProcessId;
+                                GetWindowThreadProcessId(hWnd, out windowProcessId);
+                                if (windowProcessId != targetProcessId)
+                                {
+                                    return true;
+                                }
+
+                                if (!TryMoveMatchedWindow(hWnd, state))
+                                {
+                                    return true;
+                                }
+
+                                return true;
+                            }, IntPtr.Zero);
+
+                            foreach (ProcessThread thread in process.Threads)
+                            {
+                                EnumThreadWindows((uint)thread.Id, delegate(IntPtr hWnd, IntPtr lParam)
+                                {
+                                    TryMoveMatchedWindow(hWnd, state);
+                                    return true;
+                                }, IntPtr.Zero);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+
+            return state.Moved;
+        }
+
+        private static bool TryMoveMatchedWindow(IntPtr hWnd, WindowMatchState state)
+        {
+            if (hWnd == IntPtr.Zero || (!IsWindowVisible(hWnd) && state.ToBack))
+            {
+                return false;
+            }
+
+            string title = GetWindowTitle(hWnd);
+            string className = GetWindowClassName(hWnd);
+            if (IsIgnoredWindowClass(className))
+            {
+                return false;
+            }
+
+            if (state.RequireTitleMatch && !TitleMatches(title, state.TitleTokens))
+            {
+                return false;
+            }
+
+            if (state.ToBack ? TrySendWindowToBack(hWnd) : TryBringWindowToFront(hWnd))
+            {
+                state.Moved++;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsIgnoredWindowClass(string className)
+        {
+            return className.Equals("IME", StringComparison.OrdinalIgnoreCase)
+                || className.Equals("MSCTFIME UI", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static IntPtr FindProcessWindow(string processName, string requiredClassName)
+        {
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(processName));
+            }
+            catch
+            {
+                return IntPtr.Zero;
+            }
+
+            foreach (Process process in processes)
+            {
+                using (process)
+                {
+                    WindowFindState state = new WindowFindState();
+                    state.ProcessId = process.Id;
+                    state.RequiredClassName = requiredClassName ?? "";
+                    state.Handle = IntPtr.Zero;
+
+                    EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+                    {
+                        int windowProcessId;
+                        GetWindowThreadProcessId(hWnd, out windowProcessId);
+                        if (windowProcessId != state.ProcessId || !IsWindowVisible(hWnd))
+                        {
+                            return true;
+                        }
+
+                        string className = GetWindowClassName(hWnd);
+                        if (IsIgnoredWindowClass(className))
+                        {
+                            return true;
+                        }
+
+                        if (state.RequiredClassName.Length > 0 && !className.Equals(state.RequiredClassName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+
+                        state.Handle = hWnd;
+                        return false;
+                    }, IntPtr.Zero);
+
+                    if (state.Handle != IntPtr.Zero)
+                    {
+                        return state.Handle;
+                    }
+                }
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private static Bitmap CaptureWindow(IntPtr hWnd)
+        {
+            Rect rect;
+            if (!GetWindowRect(hWnd, out rect))
+            {
+                return null;
+            }
+
+            int width = rect.Right - rect.Left;
+            int height = rect.Bottom - rect.Top;
+            if (width <= 0 || height <= 0)
+            {
+                return null;
+            }
+
+            Bitmap bitmap = null;
+            Graphics graphics = null;
+            IntPtr hdc = IntPtr.Zero;
+            try
+            {
+                bitmap = new Bitmap(width, height);
+                graphics = Graphics.FromImage(bitmap);
+                hdc = graphics.GetHdc();
+                if (!PrintWindow(hWnd, hdc, 0))
+                {
+                    bitmap.Dispose();
+                    bitmap = null;
+                }
+
+                return bitmap;
+            }
+            catch
+            {
+                if (bitmap != null)
+                {
+                    bitmap.Dispose();
+                }
+
+                return null;
+            }
+            finally
+            {
+                if (graphics != null)
+                {
+                    if (hdc != IntPtr.Zero)
+                    {
+                        graphics.ReleaseHdc(hdc);
+                    }
+
+                    graphics.Dispose();
+                }
+            }
+        }
+
+        private static bool TryFindOfflineRewardCloseButton(Bitmap image, out Point clickPoint)
+        {
+            clickPoint = Point.Empty;
+            int width = image.Width;
+            int height = image.Height;
+            if (width < 300 || height < 300)
+            {
+                return false;
+            }
+
+            int searchLeft = width / 4;
+            int searchRight = width * 3 / 4;
+            int searchTop = height / 4;
+            int searchBottom = height * 4 / 5;
+            int bestTitleY = -1;
+            int bestTitleScore = 0;
+
+            for (int y = searchTop; y < searchBottom; y += 2)
+            {
+                int score = 0;
+                for (int x = searchLeft; x < searchRight; x += 2)
+                {
+                    if (IsOfflineRewardTitleRed(image.GetPixel(x, y)))
+                    {
+                        score++;
+                    }
+                }
+
+                if (score > bestTitleScore)
+                {
+                    bestTitleScore = score;
+                    bestTitleY = y;
+                }
+            }
+
+            if (bestTitleY < 0 || bestTitleScore < Math.Max(20, (searchRight - searchLeft) / 25))
+            {
+                return false;
+            }
+
+            int titleBandTop = Math.Max(searchTop, bestTitleY - 18);
+            int titleBandBottom = Math.Min(searchBottom, bestTitleY + 18);
+            int yellowScore = 0;
+            for (int y = titleBandTop; y <= titleBandBottom; y += 2)
+            {
+                for (int x = searchLeft; x < searchRight; x += 2)
+                {
+                    if (IsOfflineRewardTitleYellow(image.GetPixel(x, y)))
+                    {
+                        yellowScore++;
+                    }
+                }
+            }
+
+            if (yellowScore < 8)
+            {
+                return false;
+            }
+
+            int buttonSearchTop = Math.Min(height - 1, bestTitleY + height / 5);
+            int buttonSearchBottom = Math.Min(height - 20, bestTitleY + height / 3 + height / 12);
+            int buttonLeft = width / 3;
+            int buttonRight = width * 2 / 3;
+            int bestX = -1;
+            int bestY = -1;
+            int bestButtonScore = 0;
+            int boxWidth = Math.Max(60, width / 12);
+            int boxHeight = Math.Max(20, height / 30);
+
+            for (int y = buttonSearchTop; y < buttonSearchBottom; y += 4)
+            {
+                for (int x = buttonLeft; x < buttonRight; x += 4)
+                {
+                    int score = CountButtonPixels(image, x, y, boxWidth, boxHeight);
+                    if (score > bestButtonScore)
+                    {
+                        bestButtonScore = score;
+                        bestX = x;
+                        bestY = y;
+                    }
+                }
+            }
+
+            if (bestX < 0 || bestButtonScore < (boxWidth * boxHeight) / 10)
+            {
+                return false;
+            }
+
+            clickPoint = new Point(bestX + boxWidth / 2, bestY + boxHeight / 2);
+            return true;
+        }
+
+        private static int CountButtonPixels(Bitmap image, int left, int top, int width, int height)
+        {
+            int right = Math.Min(image.Width, left + width);
+            int bottom = Math.Min(image.Height, top + height);
+            int score = 0;
+            for (int y = top; y < bottom; y += 2)
+            {
+                for (int x = left; x < right; x += 2)
+                {
+                    if (IsOfflineRewardButtonBrown(image.GetPixel(x, y)))
+                    {
+                        score++;
+                    }
+                }
+            }
+
+            return score * 4;
+        }
+
+        private static bool IsOfflineRewardTitleRed(Color color)
+        {
+            return color.R >= 80 && color.R <= 180
+                && color.G <= 70
+                && color.B <= 70
+                && color.R > color.G + 35
+                && color.R > color.B + 35;
+        }
+
+        private static bool IsOfflineRewardTitleYellow(Color color)
+        {
+            return color.R >= 160
+                && color.G >= 100
+                && color.B <= 80
+                && color.R >= color.G;
+        }
+
+        private static bool IsOfflineRewardButtonBrown(Color color)
+        {
+            return color.R >= 60 && color.R <= 150
+                && color.G >= 20 && color.G <= 90
+                && color.B <= 70
+                && color.R > color.G + 15;
+        }
+
+        private static bool TryRealClick(IntPtr hWnd, int x, int y)
+        {
+            try
+            {
+                Rect rect;
+                if (!GetWindowRect(hWnd, out rect))
+                {
+                    return false;
+                }
+
+                PointStruct oldPosition;
+                GetCursorPos(out oldPosition);
+
+                TryBringWindowToFront(hWnd);
+                Thread.Sleep(200);
+                SetCursorPos(rect.Left + x, rect.Top + y);
+                Thread.Sleep(50);
+                mouse_event(MouseEventLeftDown, 0, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(80);
+                mouse_event(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(50);
+                SetCursorPos(oldPosition.X, oldPosition.Y);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TrySendWindowToBack(IntPtr handle)
+        {
+            try
+            {
+                if (handle == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                return SetWindowPos(handle, HwndBottom, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate | SwpNoOwnerZOrder);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryBringWindowToFront(IntPtr handle)
+        {
+            try
+            {
+                if (handle == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                ShowWindow(handle, SwRestore);
+                AllowSetForegroundWindow(-1);
+
+                IntPtr foreground = GetForegroundWindow();
+                uint currentThread = GetCurrentThreadId();
+                int unusedProcessId;
+                uint foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out unusedProcessId);
+                uint targetThread = GetWindowThreadProcessId(handle, out unusedProcessId);
+
+                bool attachedForeground = false;
+                bool attachedTarget = false;
+                try
+                {
+                    if (foregroundThread != 0 && foregroundThread != currentThread)
+                    {
+                        attachedForeground = AttachThreadInput(currentThread, foregroundThread, true);
+                    }
+
+                    if (targetThread != 0 && targetThread != currentThread)
+                    {
+                        attachedTarget = AttachThreadInput(currentThread, targetThread, true);
+                    }
+
+                    SetWindowPos(handle, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
+                    SetWindowPos(handle, HwndNoTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
+                    BringWindowToTop(handle);
+                    SetForegroundWindow(handle);
+                    return true;
+                }
+                finally
+                {
+                    if (attachedTarget)
+                    {
+                        AttachThreadInput(currentThread, targetThread, false);
+                    }
+
+                    if (attachedForeground)
+                    {
+                        AttachThreadInput(currentThread, foregroundThread, false);
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Dictionary<string, bool> BuildProcessNameSet(string[] processNames)
+        {
+            var set = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (string processName in processNames)
+            {
+                string normalized = Path.GetFileNameWithoutExtension((processName ?? "").Trim());
+                if (normalized.Length > 0)
+                {
+                    set[normalized] = true;
+                }
+            }
+
+            return set;
+        }
+
+        private static string[] SplitConfigList(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return new string[0];
+            }
+
+            return value.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        private static string GetWindowTitle(IntPtr handle)
+        {
+            try
+            {
+                int length = GetWindowTextLength(handle);
+                if (length <= 0)
+                {
+                    return "";
+                }
+
+                var title = new StringBuilder(length + 1);
+                GetWindowText(handle, title, title.Capacity);
+                return title.ToString();
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static string GetWindowClassName(IntPtr handle)
+        {
+            try
+            {
+                var className = new StringBuilder(256);
+                GetClassName(handle, className, className.Capacity);
+                return className.ToString();
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private static bool TitleMatches(string title, string[] titleTokens)
+        {
+            if (titleTokens == null || titleTokens.Length == 0)
+            {
+                return true;
+            }
+
+            foreach (string token in titleTokens)
+            {
+                string trimmed = (token ?? "").Trim();
+                if (trimmed.Length > 0 && title.IndexOf(trimmed, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void OpenConfigFile()
@@ -463,6 +1267,101 @@ namespace TaskBarHeroGuard
             _notifyIcon.BalloonTipTitle = title;
             _notifyIcon.BalloonTipText = text;
             _notifyIcon.ShowBalloonTip(4000);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool AllowSetForegroundWindow(int processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumThreadWindows(uint threadId, EnumWindowsProc enumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+
+        [DllImport("user32.dll")]
+        private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out PointStruct point);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetCursorPos(int x, int y);
+
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        private sealed class WindowMatchState
+        {
+            public Dictionary<string, bool> ProcessNames;
+            public string[] TitleTokens;
+            public bool RequireTitleMatch;
+            public bool ToBack;
+            public int Moved;
+        }
+
+        private sealed class WindowFindState
+        {
+            public int ProcessId;
+            public string RequiredClassName;
+            public IntPtr Handle;
+        }
+
+        private struct Rect
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        private struct PointStruct
+        {
+            public int X;
+            public int Y;
         }
 
         private static string FormatBytes(long bytes)
@@ -504,6 +1403,20 @@ namespace TaskBarHeroGuard
         public int RestartCooldownSeconds = 120;
         public int GracefulCloseSeconds = 10;
         public bool AutoLaunchWhenMissing = false;
+        public bool SendStartupWindowToBack = true;
+        public int StartupWindowBackDurationSeconds = 30;
+        public string StartupBackProcessNames = "steam.exe;steamwebhelper.exe";
+        public string StartupBackWindowTitleContains = "Steam;Task Bar Hero;TaskbarHero;タスクバー ヒーロー;ゲームを起動中;起動中";
+        public bool StartupBackRequireTitleMatch = false;
+        public bool BringGameToFrontOnStageStart = true;
+        public int StageStartFrontWaitSeconds = 300;
+        public int StageStartFrontRetrySeconds = 8;
+        public string StageStartLogSignalText1 = "TaskbarHero.StageManager:igs(Boolean)";
+        public string StageStartLogSignalText2 = "";
+        public bool AutoCloseOfflineReward = true;
+        public int AutoCloseOfflineRewardDelaySeconds = 8;
+        public int AutoCloseOfflineRewardDurationSeconds = 45;
+        public int AutoCloseOfflineRewardIntervalMilliseconds = 1000;
         public bool WaitForStageLog = true;
         public string GameDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).Replace("\\Local", "\\LocalLow"), "TesseractStudio", "TaskbarHero");
         public string PlayerLogPath = "";
@@ -567,6 +1480,20 @@ namespace TaskBarHeroGuard
                 new KeyValuePair<string, string>("RestartCooldownSeconds", "120"),
                 new KeyValuePair<string, string>("GracefulCloseSeconds", "10"),
                 new KeyValuePair<string, string>("AutoLaunchWhenMissing", "false"),
+                new KeyValuePair<string, string>("SendStartupWindowToBack", "true"),
+                new KeyValuePair<string, string>("StartupWindowBackDurationSeconds", "30"),
+                new KeyValuePair<string, string>("StartupBackProcessNames", "steam.exe;steamwebhelper.exe"),
+                new KeyValuePair<string, string>("StartupBackWindowTitleContains", "Steam;Task Bar Hero;TaskbarHero;タスクバー ヒーロー;ゲームを起動中;起動中"),
+                new KeyValuePair<string, string>("StartupBackRequireTitleMatch", "false"),
+                new KeyValuePair<string, string>("BringGameToFrontOnStageStart", "true"),
+                new KeyValuePair<string, string>("StageStartFrontWaitSeconds", "300"),
+                new KeyValuePair<string, string>("StageStartFrontRetrySeconds", "8"),
+                new KeyValuePair<string, string>("StageStartLogSignalText1", "TaskbarHero.StageManager:igs(Boolean)"),
+                new KeyValuePair<string, string>("StageStartLogSignalText2", ""),
+                new KeyValuePair<string, string>("AutoCloseOfflineReward", "true"),
+                new KeyValuePair<string, string>("AutoCloseOfflineRewardDelaySeconds", "8"),
+                new KeyValuePair<string, string>("AutoCloseOfflineRewardDurationSeconds", "45"),
+                new KeyValuePair<string, string>("AutoCloseOfflineRewardIntervalMilliseconds", "1000"),
                 new KeyValuePair<string, string>("WaitForStageLog", "true"),
                 new KeyValuePair<string, string>("GameDataPath", "%USERPROFILE%\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero"),
                 new KeyValuePair<string, string>("PlayerLogPath", ""),
@@ -686,6 +1613,62 @@ namespace TaskBarHeroGuard
             {
                 AutoLaunchWhenMissing = ParseBool(value, AutoLaunchWhenMissing);
             }
+            else if (normalizedKey == "sendstartupwindowtoback")
+            {
+                SendStartupWindowToBack = ParseBool(value, SendStartupWindowToBack);
+            }
+            else if (normalizedKey == "startupwindowbackdurationseconds")
+            {
+                StartupWindowBackDurationSeconds = ParseInt(value, StartupWindowBackDurationSeconds);
+            }
+            else if (normalizedKey == "startupbackprocessnames")
+            {
+                StartupBackProcessNames = value;
+            }
+            else if (normalizedKey == "startupbackwindowtitlecontains")
+            {
+                StartupBackWindowTitleContains = value;
+            }
+            else if (normalizedKey == "startupbackrequiretitlematch")
+            {
+                StartupBackRequireTitleMatch = ParseBool(value, StartupBackRequireTitleMatch);
+            }
+            else if (normalizedKey == "bringgametofrontonstagestart")
+            {
+                BringGameToFrontOnStageStart = ParseBool(value, BringGameToFrontOnStageStart);
+            }
+            else if (normalizedKey == "stagestartfrontwaitseconds")
+            {
+                StageStartFrontWaitSeconds = ParseInt(value, StageStartFrontWaitSeconds);
+            }
+            else if (normalizedKey == "stagestartfrontretryseconds")
+            {
+                StageStartFrontRetrySeconds = ParseInt(value, StageStartFrontRetrySeconds);
+            }
+            else if (normalizedKey == "stagestartlogsignaltext1")
+            {
+                StageStartLogSignalText1 = value;
+            }
+            else if (normalizedKey == "stagestartlogsignaltext2")
+            {
+                StageStartLogSignalText2 = value;
+            }
+            else if (normalizedKey == "autocloseofflinereward")
+            {
+                AutoCloseOfflineReward = ParseBool(value, AutoCloseOfflineReward);
+            }
+            else if (normalizedKey == "autocloseofflinerewarddelayseconds")
+            {
+                AutoCloseOfflineRewardDelaySeconds = ParseInt(value, AutoCloseOfflineRewardDelaySeconds);
+            }
+            else if (normalizedKey == "autocloseofflinerewarddurationseconds")
+            {
+                AutoCloseOfflineRewardDurationSeconds = ParseInt(value, AutoCloseOfflineRewardDurationSeconds);
+            }
+            else if (normalizedKey == "autocloseofflinerewardintervalmilliseconds")
+            {
+                AutoCloseOfflineRewardIntervalMilliseconds = ParseInt(value, AutoCloseOfflineRewardIntervalMilliseconds);
+            }
             else if (normalizedKey == "waitforstagelog")
             {
                 WaitForStageLog = ParseBool(value, WaitForStageLog);
@@ -769,6 +1752,12 @@ namespace TaskBarHeroGuard
             RestartDelaySeconds = Clamp(RestartDelaySeconds, 1, 300);
             RestartCooldownSeconds = Clamp(RestartCooldownSeconds, 10, 3600);
             GracefulCloseSeconds = Clamp(GracefulCloseSeconds, 0, 300);
+            StartupWindowBackDurationSeconds = Clamp(StartupWindowBackDurationSeconds, 1, 300);
+            StageStartFrontWaitSeconds = Clamp(StageStartFrontWaitSeconds, 1, 3600);
+            StageStartFrontRetrySeconds = Clamp(StageStartFrontRetrySeconds, 1, 60);
+            AutoCloseOfflineRewardDelaySeconds = Clamp(AutoCloseOfflineRewardDelaySeconds, 0, 300);
+            AutoCloseOfflineRewardDurationSeconds = Clamp(AutoCloseOfflineRewardDurationSeconds, 1, 300);
+            AutoCloseOfflineRewardIntervalMilliseconds = Clamp(AutoCloseOfflineRewardIntervalMilliseconds, 250, 10000);
             MaxDeferralSeconds = Clamp(MaxDeferralSeconds, 10, 86400);
             StageSignalSettleSeconds = Clamp(StageSignalSettleSeconds, 0, 3600);
             SaveSettleSeconds = Clamp(SaveSettleSeconds, 0, 3600);
