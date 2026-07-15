@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $outDir = Join-Path $root 'dist'
 $src = Join-Path $root 'src\TaskBarHeroGuard\Program.cs'
+$icon = Join-Path $root 'src\TaskBarHeroGuard\TaskBarHeroGuard.ico'
 $exe = Join-Path $outDir 'TaskBarHeroGuard.exe'
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 
@@ -17,6 +18,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     /target:winexe `
     /optimize+ `
     /platform:x64 `
+    /win32icon:$icon `
     /out:$exe `
     /reference:System.dll `
     /reference:System.Core.dll `

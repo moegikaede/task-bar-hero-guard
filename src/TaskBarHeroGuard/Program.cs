@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -37,8 +38,9 @@ namespace TaskBarHeroGuard
         private readonly NotifyIcon _notifyIcon;
         private readonly System.Windows.Forms.Timer _timer;
         private readonly System.Windows.Forms.Timer _startupWindowTimer;
-        private readonly ToolStripMenuItem _statusItem;
-        private readonly ToolStripMenuItem _thresholdItem;
+        private readonly ToolStripMenuItem _startupItem;
+        private readonly ToolStripLabel _statusItem;
+        private readonly ToolStripLabel _thresholdItem;
         private GuardConfig _config;
         private DateTime _nextRestartAllowedUtc = DateTime.MinValue;
         private long _lastObservedBytes;
@@ -49,18 +51,25 @@ namespace TaskBarHeroGuard
         private long _pendingLogPosition;
         private DateTime _pendingSaveWriteUtc = DateTime.MinValue;
         private DateTime _stageSignalSeenUtc = DateTime.MinValue;
+        private bool _pendingRestartMustWaitForStage;
         private DateTime _sendStartupWindowToBackUntilUtc = DateTime.MinValue;
         private DateTime _bringGameToFrontUntilUtc = DateTime.MinValue;
         private DateTime _bringGameToFrontRetryUntilUtc = DateTime.MinValue;
         private DateTime _autoCloseOfflineRewardUntilUtc = DateTime.MinValue;
         private DateTime _nextAutoCloseOfflineRewardCheckUtc = DateTime.MinValue;
+        private DateTime _restoreRestartWindowPositionUntilUtc = DateTime.MinValue;
+        private DateTime _keepGameTopMostUntilUtc = DateTime.MinValue;
+        private readonly Dictionary<IntPtr, bool> _temporaryTopMostWindows = new Dictionary<IntPtr, bool>();
+        private readonly HashSet<IntPtr> _startupWindowsSentToBack = new HashSet<IntPtr>();
+        private Rect _restartWindowRect;
         private long _stageStartLogPosition;
         private bool _startupWindowMoved;
         private bool _waitingForStageStartToFront;
         private bool _retryBringGameToFront;
         private bool _autoCloseOfflineReward;
+        private bool _restoreRestartWindowPosition;
         private bool _targetWasRunning;
-        private DateTime _lastStartupHandlingUtc = DateTime.MinValue;
+        private bool _startupHandlingInitializedForLaunch;
 
         private static readonly IntPtr HwndTop = new IntPtr(0);
         private static readonly IntPtr HwndBottom = new IntPtr(1);
@@ -68,12 +77,12 @@ namespace TaskBarHeroGuard
         private static readonly IntPtr HwndNoTopMost = new IntPtr(-2);
         private const uint SwpNoSize = 0x0001;
         private const uint SwpNoMove = 0x0002;
+        private const uint SwpNoZOrder = 0x0004;
         private const uint SwpNoActivate = 0x0010;
         private const uint SwpNoOwnerZOrder = 0x0200;
         private const int SwRestore = 9;
-        private const int WmLButtonDown = 0x0201;
-        private const int WmLButtonUp = 0x0202;
-        private const int MkLButton = 0x0001;
+        private const int GwlExStyle = -20;
+        private const int WsExTopMost = 0x00000008;
         private const uint MouseEventLeftDown = 0x0002;
         private const uint MouseEventLeftUp = 0x0004;
 
@@ -82,20 +91,29 @@ namespace TaskBarHeroGuard
             _args = args;
             _config = GuardConfig.Load(args);
 
-            _statusItem = new ToolStripMenuItem("Status: starting");
-            _statusItem.Enabled = false;
+            _startupItem = new ToolStripMenuItem("スタートアップ登録");
+            _startupItem.CheckOnClick = false;
+            _startupItem.Click += delegate { ToggleStartupRegistration(); };
 
-            _thresholdItem = new ToolStripMenuItem("");
-            _thresholdItem.Enabled = false;
+            // Status rows are informational labels, not disabled commands. Labels retain the
+            // normal menu text color without becoming selectable or looking unavailable.
+            _statusItem = new ToolStripLabel("Status: starting");
+            _statusItem.ForeColor = SystemColors.MenuText;
+
+            _thresholdItem = new ToolStripLabel("");
+            _thresholdItem.ForeColor = SystemColors.MenuText;
 
             var menu = new ContextMenuStrip();
+            menu.Opening += delegate { UpdateStartupMenuItem(); };
+            menu.Items.Add(_startupItem);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_statusItem);
             menu.Items.Add(_thresholdItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Launch Task Bar Hero", null, delegate { LaunchGame(); });
             menu.Items.Add("Send startup windows to back", null, delegate { SendStartupWindowsToBack(true); });
             menu.Items.Add("Bring Task Bar Hero to front", null, delegate { BringGameWindowsToFront(true); });
-            menu.Items.Add("Restart Task Bar Hero", null, delegate { RestartGame("Manual restart", true); });
+            menu.Items.Add("Restart Task Bar Hero", null, delegate { RequestManualRestart(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Open config", null, delegate { OpenConfigFile(); });
             menu.Items.Add("Reload config", null, delegate { ReloadConfig(true); });
@@ -126,6 +144,7 @@ namespace TaskBarHeroGuard
         {
             _timer.Stop();
             _startupWindowTimer.Stop();
+            ReleaseGameTopMostHold();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _startupWindowTimer.Dispose();
@@ -153,7 +172,14 @@ namespace TaskBarHeroGuard
                 Process[] processes = GetTargetProcesses();
                 if (processes.Length == 0)
                 {
+                    bool targetStoppedSinceLastCheck = _targetWasRunning;
                     _targetWasRunning = false;
+                    if (targetStoppedSinceLastCheck)
+                    {
+                        // Only a real running-to-stopped transition opens a new external launch.
+                        // Steam's expected startup gap must preserve the launch already initialized.
+                        _startupHandlingInitializedForLaunch = false;
+                    }
                     _lastObservedBytes = 0;
                     _lastObservedUtc = DateTime.UtcNow;
                     ResetPendingRestart();
@@ -211,7 +237,7 @@ namespace TaskBarHeroGuard
                 {
                     if (_config.WaitForStageLog)
                     {
-                        BeginPendingRestart("Memory limit exceeded: " + FormatBytes(maxBytes));
+                        BeginPendingRestart("Memory limit exceeded: " + FormatBytes(maxBytes), false);
                     }
                     else
                     {
@@ -233,10 +259,37 @@ namespace TaskBarHeroGuard
             }
         }
 
-        private void BeginPendingRestart(string reason)
+        private void RequestManualRestart()
+        {
+            if (_restartPending)
+            {
+                ShowBalloon("Restart already pending", "Waiting for the current stage to finish.");
+                return;
+            }
+
+            Process[] processes = GetTargetProcesses();
+            bool isRunning = processes.Length > 0;
+            foreach (Process process in processes)
+            {
+                process.Dispose();
+            }
+
+            if (!isRunning)
+            {
+                ShowBalloon("Task Bar Hero is not running", "There is no running game to restart.");
+                return;
+            }
+
+            // A tray restart is an explicit safe-point request. Unlike memory protection,
+            // it must never force a restart before the stage completion and save are observed.
+            BeginPendingRestart("Manual restart requested", true);
+        }
+
+        private void BeginPendingRestart(string reason, bool mustWaitForStage)
         {
             _restartPending = true;
             _pendingReason = reason;
+            _pendingRestartMustWaitForStage = mustWaitForStage;
             _pendingSinceUtc = DateTime.UtcNow;
             _pendingLogPosition = GetFileLength(_config.PlayerLogPath);
             _pendingSaveWriteUtc = GetLastWriteUtc(_config.SaveFilePath);
@@ -251,13 +304,13 @@ namespace TaskBarHeroGuard
             DateTime now = DateTime.UtcNow;
             UpdateTrayText("restart pending");
 
-            if (maxBytes >= _config.HardThresholdBytes)
+            if (!_pendingRestartMustWaitForStage && maxBytes >= _config.HardThresholdBytes)
             {
                 RestartGame("Hard memory limit exceeded while pending: " + FormatBytes(maxBytes));
                 return;
             }
 
-            if ((now - _pendingSinceUtc).TotalSeconds >= _config.MaxDeferralSeconds)
+            if (!_pendingRestartMustWaitForStage && (now - _pendingSinceUtc).TotalSeconds >= _config.MaxDeferralSeconds)
             {
                 RestartGame("Max deferral reached. " + _pendingReason);
                 return;
@@ -292,14 +345,15 @@ namespace TaskBarHeroGuard
                 return false;
             }
 
-            return chunk.IndexOf(_config.StageLogSignalText1, StringComparison.Ordinal) >= 0
-                && chunk.IndexOf(_config.StageLogSignalText2, StringComparison.Ordinal) >= 0;
+            return ContainsConfiguredSignal(chunk, _config.StageLogSignalText1)
+                && ContainsConfiguredSignal(chunk, _config.StageLogSignalText2);
         }
 
         private void ResetPendingRestart()
         {
             _restartPending = false;
             _pendingReason = "";
+            _pendingRestartMustWaitForStage = false;
             _pendingSinceUtc = DateTime.MinValue;
             _pendingLogPosition = GetFileLength(_config.PlayerLogPath);
             _pendingSaveWriteUtc = GetLastWriteUtc(_config.SaveFilePath);
@@ -426,6 +480,11 @@ namespace TaskBarHeroGuard
 
             _nextRestartAllowedUtc = now.AddSeconds(_config.RestartCooldownSeconds);
             ResetPendingRestart();
+            RememberRestartWindowPosition();
+            ReleaseGameTopMostHold();
+            // RestartGame owns the next launch, so discard only the previous launch generation.
+            _startupHandlingInitializedForLaunch = false;
+            _targetWasRunning = false;
             UpdateTrayText("restarting");
             ShowBalloon("Restarting Task Bar Hero", reason);
 
@@ -498,31 +557,44 @@ namespace TaskBarHeroGuard
         private void BeginStartupWindowHandling()
         {
             DateTime now = DateTime.UtcNow;
-            if ((now - _lastStartupHandlingUtc).TotalSeconds < 3)
+            if (_startupHandlingInitializedForLaunch)
             {
                 return;
             }
 
-            _lastStartupHandlingUtc = now;
+            // Steam launch and process discovery describe the same launch. Initializing twice
+            // loses both handled window identities and unread stage-log position.
+            _startupHandlingInitializedForLaunch = true;
             _startupWindowMoved = false;
+            // A new launch has a new sequence of Steam, splash, and Unity window handles.
+            _startupWindowsSentToBack.Clear();
             _waitingForStageStartToFront = _config.BringGameToFrontOnStageStart;
             _retryBringGameToFront = false;
             _autoCloseOfflineReward = _config.AutoCloseOfflineReward;
+            int restoreWindowPositionSeconds = _config.RestoreRestartWindowPositionSeconds;
+            if (_config.BringGameToFrontOnStageStart)
+            {
+                restoreWindowPositionSeconds = Math.Max(restoreWindowPositionSeconds, _config.StageStartFrontWaitSeconds);
+            }
+
+            _restoreRestartWindowPositionUntilUtc = _restoreRestartWindowPosition
+                ? now.AddSeconds(restoreWindowPositionSeconds)
+                : DateTime.MinValue;
             _stageStartLogPosition = GetRecentFileStartPosition(_config.PlayerLogPath, _config.MaxLogReadBytes);
             _sendStartupWindowToBackUntilUtc = _config.SendStartupWindowToBack
-                ? DateTime.UtcNow.AddSeconds(_config.StartupWindowBackDurationSeconds)
+                ? now.AddSeconds(_config.StartupWindowBackDurationSeconds)
                 : DateTime.MinValue;
             _bringGameToFrontUntilUtc = _config.BringGameToFrontOnStageStart
-                ? DateTime.UtcNow.AddSeconds(_config.StageStartFrontWaitSeconds)
+                ? now.AddSeconds(_config.StageStartFrontWaitSeconds)
                 : DateTime.MinValue;
             _nextAutoCloseOfflineRewardCheckUtc = _config.AutoCloseOfflineReward
-                ? DateTime.UtcNow.AddSeconds(_config.AutoCloseOfflineRewardDelaySeconds)
+                ? now.AddSeconds(_config.AutoCloseOfflineRewardDelaySeconds)
                 : DateTime.MinValue;
             _autoCloseOfflineRewardUntilUtc = _config.AutoCloseOfflineReward
                 ? _nextAutoCloseOfflineRewardCheckUtc.AddSeconds(_config.AutoCloseOfflineRewardDurationSeconds)
                 : DateTime.MinValue;
 
-            if ((_config.SendStartupWindowToBack || _config.BringGameToFrontOnStageStart || _config.AutoCloseOfflineReward) && !_startupWindowTimer.Enabled)
+            if ((_config.SendStartupWindowToBack || _config.BringGameToFrontOnStageStart || _config.AutoCloseOfflineReward || _restoreRestartWindowPosition) && !_startupWindowTimer.Enabled)
             {
                 _startupWindowTimer.Start();
             }
@@ -546,6 +618,11 @@ namespace TaskBarHeroGuard
                 else if (TryConsumeStageStartSignal())
                 {
                     _waitingForStageStartToFront = false;
+                    // Unity can replace or reposition its final window well after the process first appears.
+                    // Restart the correction window from the stage signal so the gameplay window is the target.
+                    ExtendRestartWindowPositionRestore(
+                        now,
+                        Math.Max(_config.RestoreRestartWindowPositionSeconds, _config.RestoreRestartWindowPositionAfterStageStartSeconds));
                     StopStartupWindowBack();
                     BeginBringGameToFrontRetry();
                 }
@@ -571,6 +648,8 @@ namespace TaskBarHeroGuard
                 }
                 else if (now >= _nextAutoCloseOfflineRewardCheckUtc)
                 {
+                    // A physical click can still miss a Unity frame boundary. End monitoring only
+                    // after a fresh capture proves the detected popup has disappeared.
                     if (TryAutoCloseOfflineReward())
                     {
                         StopAutoCloseOfflineReward();
@@ -582,7 +661,28 @@ namespace TaskBarHeroGuard
                 }
             }
 
-            if (now > _sendStartupWindowToBackUntilUtc && !_waitingForStageStartToFront && !_retryBringGameToFront && !_autoCloseOfflineReward)
+            if (_restoreRestartWindowPosition)
+            {
+                if (now > _restoreRestartWindowPositionUntilUtc)
+                {
+                    StopRestoreRestartWindowPosition();
+                }
+                else
+                {
+                    TryRestoreRestartWindowPosition();
+                }
+            }
+
+            if (_keepGameTopMostUntilUtc != DateTime.MinValue && now > _keepGameTopMostUntilUtc)
+            {
+                ReleaseGameTopMostHold();
+            }
+            else if (_keepGameTopMostUntilUtc != DateTime.MinValue)
+            {
+                MaintainGameTopMostHold();
+            }
+
+            if (now > _sendStartupWindowToBackUntilUtc && !_waitingForStageStartToFront && !_retryBringGameToFront && !_autoCloseOfflineReward && !_restoreRestartWindowPosition && _keepGameTopMostUntilUtc == DateTime.MinValue)
             {
                 _startupWindowTimer.Stop();
                 if (_startupWindowMoved)
@@ -612,6 +712,93 @@ namespace TaskBarHeroGuard
             _nextAutoCloseOfflineRewardCheckUtc = DateTime.MinValue;
         }
 
+        private void RememberRestartWindowPosition()
+        {
+            _restoreRestartWindowPosition = false;
+            _restartWindowRect = new Rect();
+            _restoreRestartWindowPositionUntilUtc = DateTime.MinValue;
+
+            if (!_config.RestoreRestartWindowPosition)
+            {
+                return;
+            }
+
+            IntPtr hWnd = FindProcessWindow(_config.ProcessName, "UnityWndClass");
+            Rect rect;
+            if (hWnd == IntPtr.Zero || !GetWindowRect(hWnd, out rect))
+            {
+                return;
+            }
+
+            if ((rect.Right - rect.Left) <= 0 || (rect.Bottom - rect.Top) <= 0)
+            {
+                return;
+            }
+
+            _restartWindowRect = rect;
+            _restoreRestartWindowPosition = true;
+        }
+
+        private void StopRestoreRestartWindowPosition()
+        {
+            _restoreRestartWindowPosition = false;
+            _restoreRestartWindowPositionUntilUtc = DateTime.MinValue;
+        }
+
+        private void ExtendRestartWindowPositionRestore(DateTime now, int seconds)
+        {
+            if (!_restoreRestartWindowPosition || seconds <= 0)
+            {
+                return;
+            }
+
+            DateTime restoreUntil = now.AddSeconds(seconds);
+            if (restoreUntil > _restoreRestartWindowPositionUntilUtc)
+            {
+                _restoreRestartWindowPositionUntilUtc = restoreUntil;
+            }
+        }
+
+        private bool TryRestoreRestartWindowPosition()
+        {
+            IntPtr hWnd = FindProcessWindow(_config.ProcessName, "UnityWndClass");
+            if (hWnd == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            Rect current;
+            if (!GetWindowRect(hWnd, out current))
+            {
+                return false;
+            }
+
+            int tolerance = _config.RestartWindowPositionTolerancePixels;
+            int dx = Math.Abs(current.Left - _restartWindowRect.Left);
+            int dy = Math.Abs(current.Top - _restartWindowRect.Top);
+            if (dx <= tolerance && dy <= tolerance)
+            {
+                return true;
+            }
+
+            int width = current.Right - current.Left;
+            int height = current.Bottom - current.Top;
+            if (width <= 0 || height <= 0)
+            {
+                width = _restartWindowRect.Right - _restartWindowRect.Left;
+                height = _restartWindowRect.Bottom - _restartWindowRect.Top;
+            }
+
+            return SetWindowPos(
+                hWnd,
+                IntPtr.Zero,
+                _restartWindowRect.Left,
+                _restartWindowRect.Top,
+                width,
+                height,
+                SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder);
+        }
+
         private bool TryConsumeStageStartSignal()
         {
             string chunk = ReadLogChunk(_config.PlayerLogPath, ref _stageStartLogPosition, _config.MaxLogReadBytes);
@@ -625,20 +812,54 @@ namespace TaskBarHeroGuard
 
         private static bool ContainsSignal(string chunk, string signal1, string signal2)
         {
-            if (string.IsNullOrEmpty(signal1) || chunk.IndexOf(signal1, StringComparison.Ordinal) < 0)
+            if (!ContainsConfiguredSignal(chunk, signal1))
             {
                 return false;
             }
 
-            return string.IsNullOrEmpty(signal2) || chunk.IndexOf(signal2, StringComparison.Ordinal) >= 0;
+            return string.IsNullOrEmpty(signal2) || ContainsConfiguredSignal(chunk, signal2);
+        }
+
+        private static bool ContainsConfiguredSignal(string chunk, string signal)
+        {
+            if (string.IsNullOrEmpty(signal))
+            {
+                return false;
+            }
+
+            int wildcard = signal.IndexOf('*');
+            if (wildcard < 0)
+            {
+                return chunk.IndexOf(signal, StringComparison.Ordinal) >= 0;
+            }
+
+            string prefix = signal.Substring(0, wildcard);
+            string suffix = signal.Substring(wildcard + 1);
+            using (var reader = new StringReader(chunk))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    int prefixIndex = line.IndexOf(prefix, StringComparison.Ordinal);
+                    if (prefixIndex >= 0
+                        && line.IndexOf(suffix, prefixIndex + prefix.Length, StringComparison.Ordinal) >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private void SendStartupWindowsToBack(bool showBalloon)
         {
             int moved = 0;
 
-            moved += MoveWindowsForProcessNamesToBack(new string[] { _config.ProcessName }, new string[0], false);
-            moved += MoveWindowsForProcessNamesToBack(SplitConfigList(_config.StartupBackProcessNames), SplitConfigList(_config.StartupBackWindowTitleContains), _config.StartupBackRequireTitleMatch);
+            // Reordering the same handle every timer tick fights applications that activate themselves.
+            // Each window generation is sent back once; replacement Unity windows are still handled.
+            moved += MoveWindowsForProcessNamesToBack(new string[] { _config.ProcessName }, new string[0], false, _startupWindowsSentToBack);
+            moved += MoveWindowsForProcessNamesToBack(SplitConfigList(_config.StartupBackProcessNames), SplitConfigList(_config.StartupBackWindowTitleContains), _config.StartupBackRequireTitleMatch, _startupWindowsSentToBack);
 
             if (moved > 0)
             {
@@ -654,15 +875,70 @@ namespace TaskBarHeroGuard
         private void BringGameWindowsToFront(bool showBalloon)
         {
             StopStartupWindowBack();
-            int moved = MoveWindowsForProcessNamesToFront(new string[] { _config.ProcessName }, new string[0], false);
-            if (moved > 0)
+            bool keepTopMost = _config.KeepGameTopMostAfterStageStart;
+            IntPtr hWnd = FindProcessWindow(_config.ProcessName, "UnityWndClass");
+            bool originalWasTopMost;
+            if (hWnd != IntPtr.Zero && TryBringWindowToFront(hWnd, keepTopMost, out originalWasTopMost))
             {
+                if (keepTopMost)
+                {
+                    RememberGameTopMostState(hWnd, originalWasTopMost);
+                    // Keep the gameplay window topmost for the whole run. A fixed timeout lets it
+                    // fall behind unrelated windows even though the option remains enabled.
+                    _keepGameTopMostUntilUtc = DateTime.MaxValue;
+                    MaintainGameTopMostHold();
+                    if (!_startupWindowTimer.Enabled)
+                    {
+                        _startupWindowTimer.Start();
+                    }
+                }
+
                 UpdateTrayText("game brought to front");
             }
             else if (showBalloon)
             {
                 ShowBalloon("Task Bar Hero window not found", "No visible game window is ready yet.");
             }
+        }
+
+        private void MaintainGameTopMostHold()
+        {
+            IntPtr hWnd = FindProcessWindow(_config.ProcessName, "UnityWndClass");
+            if (hWnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            RememberGameTopMostState(hWnd, IsWindowTopMost(hWnd));
+            SetWindowPos(hWnd, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate | SwpNoOwnerZOrder);
+        }
+
+        private void RememberGameTopMostState(IntPtr hWnd, bool originalWasTopMost)
+        {
+            if (hWnd != IntPtr.Zero && !_temporaryTopMostWindows.ContainsKey(hWnd))
+            {
+                _temporaryTopMostWindows[hWnd] = originalWasTopMost;
+            }
+        }
+
+        private void ReleaseGameTopMostHold()
+        {
+            foreach (KeyValuePair<IntPtr, bool> window in new List<KeyValuePair<IntPtr, bool>>(_temporaryTopMostWindows))
+            {
+                try
+                {
+                    if (!window.Value && IsWindow(window.Key) && IsWindowTopMost(window.Key))
+                    {
+                        SetWindowPos(window.Key, HwndNoTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate | SwpNoOwnerZOrder);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            _temporaryTopMostWindows.Clear();
+            _keepGameTopMostUntilUtc = DateTime.MinValue;
         }
 
         private bool TryAutoCloseOfflineReward()
@@ -682,32 +958,61 @@ namespace TaskBarHeroGuard
                 }
             }
 
+            // Unity ignores synthetic background button messages in this screen. Stop the competing
+            // Z-order loop before the verified real click, then return the startup window once.
+            StopStartupWindowBack();
             bool clicked = TryRealClick(hWnd, clickPoint.X, clickPoint.Y);
             if (clicked)
             {
                 UpdateTrayText("offline reward closed");
+                TrySendWindowToBack(hWnd);
+                Thread.Sleep(400);
+
+                using (Bitmap verification = CaptureWindow(hWnd))
+                {
+                    Point remainingButton;
+                    return verification != null && !TryFindOfflineRewardCloseButton(verification, out remainingButton);
+                }
             }
 
-            return clicked;
+            return false;
         }
 
-        private static int MoveWindowsForProcessNamesToBack(string[] processNames, string[] titleTokens, bool requireTitleMatch)
+        private static int MoveWindowsForProcessNamesToBack(string[] processNames, string[] titleTokens, bool requireTitleMatch, HashSet<IntPtr> handledWindows)
         {
-            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, true);
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, true, false, null, handledWindows);
         }
 
         private static int MoveWindowsForProcessNamesToFront(string[] processNames, string[] titleTokens, bool requireTitleMatch)
         {
-            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, false);
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, false, false, null);
+        }
+
+        private static int MoveWindowsForProcessNamesToFront(string[] processNames, string[] titleTokens, bool requireTitleMatch, bool keepTopMost, Dictionary<IntPtr, bool> temporaryTopMostWindows)
+        {
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, false, keepTopMost, temporaryTopMostWindows);
         }
 
         private static int MoveWindowsForProcessNames(string[] processNames, string[] titleTokens, bool requireTitleMatch, bool toBack)
+        {
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, toBack, false, null, null);
+        }
+
+        private static int MoveWindowsForProcessNames(string[] processNames, string[] titleTokens, bool requireTitleMatch, bool toBack, bool keepTopMost, Dictionary<IntPtr, bool> temporaryTopMostWindows)
+        {
+            return MoveWindowsForProcessNames(processNames, titleTokens, requireTitleMatch, toBack, keepTopMost, temporaryTopMostWindows, null);
+        }
+
+        private static int MoveWindowsForProcessNames(string[] processNames, string[] titleTokens, bool requireTitleMatch, bool toBack, bool keepTopMost, Dictionary<IntPtr, bool> temporaryTopMostWindows, HashSet<IntPtr> handledWindows)
         {
             WindowMatchState state = new WindowMatchState();
             state.ProcessNames = BuildProcessNameSet(processNames);
             state.TitleTokens = titleTokens;
             state.RequireTitleMatch = requireTitleMatch;
             state.ToBack = toBack;
+            state.KeepTopMost = keepTopMost;
+            state.TemporaryTopMostWindows = temporaryTopMostWindows;
+            state.HandledWindows = handledWindows;
             state.Moved = 0;
 
             if (state.ProcessNames.Count == 0)
@@ -777,6 +1082,11 @@ namespace TaskBarHeroGuard
                 return false;
             }
 
+            if (state.ToBack && state.HandledWindows != null && state.HandledWindows.Contains(hWnd))
+            {
+                return false;
+            }
+
             string title = GetWindowTitle(hWnd);
             string className = GetWindowClassName(hWnd);
             if (IsIgnoredWindowClass(className))
@@ -789,8 +1099,19 @@ namespace TaskBarHeroGuard
                 return false;
             }
 
-            if (state.ToBack ? TrySendWindowToBack(hWnd) : TryBringWindowToFront(hWnd))
+            bool originalWasTopMost = false;
+            if (state.ToBack ? TrySendWindowToBack(hWnd) : TryBringWindowToFront(hWnd, state.KeepTopMost, out originalWasTopMost))
             {
+                if (state.KeepTopMost && state.TemporaryTopMostWindows != null && !state.TemporaryTopMostWindows.ContainsKey(hWnd))
+                {
+                    state.TemporaryTopMostWindows[hWnd] = originalWasTopMost;
+                }
+
+                if (state.ToBack && state.HandledWindows != null)
+                {
+                    state.HandledWindows.Add(hWnd);
+                }
+
                 state.Moved++;
                 return true;
             }
@@ -1054,7 +1375,7 @@ namespace TaskBarHeroGuard
             try
             {
                 Rect rect;
-                if (!GetWindowRect(hWnd, out rect))
+                if (hWnd == IntPtr.Zero || !GetWindowRect(hWnd, out rect))
                 {
                     return false;
                 }
@@ -1063,13 +1384,13 @@ namespace TaskBarHeroGuard
                 GetCursorPos(out oldPosition);
 
                 TryBringWindowToFront(hWnd);
-                Thread.Sleep(200);
+                Thread.Sleep(150);
                 SetCursorPos(rect.Left + x, rect.Top + y);
-                Thread.Sleep(50);
+                Thread.Sleep(40);
                 mouse_event(MouseEventLeftDown, 0, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(80);
+                Thread.Sleep(60);
                 mouse_event(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(50);
+                Thread.Sleep(40);
                 SetCursorPos(oldPosition.X, oldPosition.Y);
                 return true;
             }
@@ -1098,6 +1419,13 @@ namespace TaskBarHeroGuard
 
         private static bool TryBringWindowToFront(IntPtr handle)
         {
+            bool unusedOriginalWasTopMost;
+            return TryBringWindowToFront(handle, false, out unusedOriginalWasTopMost);
+        }
+
+        private static bool TryBringWindowToFront(IntPtr handle, bool keepTopMost, out bool originalWasTopMost)
+        {
+            originalWasTopMost = false;
             try
             {
                 if (handle == IntPtr.Zero)
@@ -1105,6 +1433,7 @@ namespace TaskBarHeroGuard
                     return false;
                 }
 
+                originalWasTopMost = IsWindowTopMost(handle);
                 ShowWindow(handle, SwRestore);
                 AllowSetForegroundWindow(-1);
 
@@ -1128,11 +1457,15 @@ namespace TaskBarHeroGuard
                         attachedTarget = AttachThreadInput(currentThread, targetThread, true);
                     }
 
-                    SetWindowPos(handle, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
-                    SetWindowPos(handle, HwndNoTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
+                    bool topMostSet = SetWindowPos(handle, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
+                    if (!keepTopMost)
+                    {
+                        SetWindowPos(handle, HwndNoTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoOwnerZOrder);
+                    }
+
                     BringWindowToTop(handle);
                     SetForegroundWindow(handle);
-                    return true;
+                    return keepTopMost ? topMostSet : true;
                 }
                 finally
                 {
@@ -1149,8 +1482,14 @@ namespace TaskBarHeroGuard
             }
             catch
             {
+                originalWasTopMost = false;
                 return false;
             }
+        }
+
+        private static bool IsWindowTopMost(IntPtr handle)
+        {
+            return handle != IntPtr.Zero && (GetWindowLong(handle, GwlExStyle) & WsExTopMost) != 0;
         }
 
         private static Dictionary<string, bool> BuildProcessNameSet(string[] processNames)
@@ -1231,6 +1570,139 @@ namespace TaskBarHeroGuard
             return false;
         }
 
+        private void UpdateStartupMenuItem()
+        {
+            _startupItem.Checked = IsStartupRegistered();
+        }
+
+        private void ToggleStartupRegistration()
+        {
+            try
+            {
+                if (IsStartupRegistered())
+                {
+                    string shortcutPath = GetStartupShortcutPath();
+                    if (File.Exists(shortcutPath))
+                    {
+                        File.Delete(shortcutPath);
+                    }
+
+                    _startupItem.Checked = false;
+                    ShowBalloon("Startup registration removed", "Task Bar Hero Guard will not start with Windows.");
+                    return;
+                }
+
+                CreateStartupShortcut();
+                _startupItem.Checked = true;
+                ShowBalloon("Startup registration added", "Task Bar Hero Guard will start with Windows.");
+            }
+            catch (Exception ex)
+            {
+                UpdateStartupMenuItem();
+                ShowBalloon("Startup registration failed", ex.Message);
+            }
+        }
+
+        private static bool IsStartupRegistered()
+        {
+            string shortcutPath = GetStartupShortcutPath();
+            if (!File.Exists(shortcutPath))
+            {
+                return false;
+            }
+
+            string targetPath = ReadShortcutTargetPath(shortcutPath);
+            return PathsEqual(targetPath, Application.ExecutablePath);
+        }
+
+        private static void CreateStartupShortcut()
+        {
+            string shortcutPath = GetStartupShortcutPath();
+            Directory.CreateDirectory(Path.GetDirectoryName(shortcutPath));
+
+            object shell = null;
+            object shortcut = null;
+            try
+            {
+                shell = CreateWScriptShell();
+                shortcut = shell.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { shortcutPath });
+                Type shortcutType = shortcut.GetType();
+                shortcutType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath });
+                shortcutType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, new object[] { AppDomain.CurrentDomain.BaseDirectory });
+                shortcutType.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, new object[] { "Task Bar Hero Guard" });
+                shortcutType.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, new object[] { Application.ExecutablePath });
+                shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
+            }
+            finally
+            {
+                ReleaseComObject(shortcut);
+                ReleaseComObject(shell);
+            }
+        }
+
+        private static string ReadShortcutTargetPath(string shortcutPath)
+        {
+            object shell = null;
+            object shortcut = null;
+            try
+            {
+                shell = CreateWScriptShell();
+                shortcut = shell.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { shortcutPath });
+                object targetPath = shortcut.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, shortcut, null);
+                return targetPath == null ? "" : targetPath.ToString();
+            }
+            catch
+            {
+                return "";
+            }
+            finally
+            {
+                ReleaseComObject(shortcut);
+                ReleaseComObject(shell);
+            }
+        }
+
+        private static object CreateWScriptShell()
+        {
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null)
+            {
+                throw new InvalidOperationException("WScript.Shell is not available.");
+            }
+
+            return Activator.CreateInstance(shellType);
+        }
+
+        private static void ReleaseComObject(object value)
+        {
+            if (value != null && Marshal.IsComObject(value))
+            {
+                Marshal.FinalReleaseComObject(value);
+            }
+        }
+
+        private static string GetStartupShortcutPath()
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "TaskBarHeroGuard.lnk");
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(Path.GetFullPath(left.Trim().Trim('"')), Path.GetFullPath(right.Trim().Trim('"')), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(left.Trim().Trim('"'), right.Trim().Trim('"'), StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
         private void OpenConfigFile()
         {
             try
@@ -1297,6 +1769,12 @@ namespace TaskBarHeroGuard
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc enumFunc, IntPtr lParam);
 
         [DllImport("user32.dll")]
@@ -1309,12 +1787,6 @@ namespace TaskBarHeroGuard
         private static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
 
         [DllImport("user32.dll")]
-        private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
-
-        [DllImport("user32.dll")]
-        private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out PointStruct point);
 
         [DllImport("user32.dll")]
@@ -1322,6 +1794,9 @@ namespace TaskBarHeroGuard
 
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+
+        [DllImport("user32.dll")]
+        private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
@@ -1340,6 +1815,9 @@ namespace TaskBarHeroGuard
             public string[] TitleTokens;
             public bool RequireTitleMatch;
             public bool ToBack;
+            public bool KeepTopMost;
+            public Dictionary<IntPtr, bool> TemporaryTopMostWindows;
+            public HashSet<IntPtr> HandledWindows;
             public int Moved;
         }
 
@@ -1409,20 +1887,25 @@ namespace TaskBarHeroGuard
         public string StartupBackWindowTitleContains = "Steam;Task Bar Hero;TaskbarHero;タスクバー ヒーロー;ゲームを起動中;起動中";
         public bool StartupBackRequireTitleMatch = false;
         public bool BringGameToFrontOnStageStart = true;
+        public bool KeepGameTopMostAfterStageStart = true;
         public int StageStartFrontWaitSeconds = 300;
         public int StageStartFrontRetrySeconds = 8;
-        public string StageStartLogSignalText1 = "TaskbarHero.StageManager:igs(Boolean)";
+        public string StageStartLogSignalText1 = "TaskbarHero.StageManager:*(Boolean)";
         public string StageStartLogSignalText2 = "";
         public bool AutoCloseOfflineReward = true;
         public int AutoCloseOfflineRewardDelaySeconds = 8;
         public int AutoCloseOfflineRewardDurationSeconds = 45;
         public int AutoCloseOfflineRewardIntervalMilliseconds = 1000;
+        public bool RestoreRestartWindowPosition = true;
+        public int RestartWindowPositionTolerancePixels = 80;
+        public int RestoreRestartWindowPositionSeconds = 60;
+        public int RestoreRestartWindowPositionAfterStageStartSeconds = 15;
         public bool WaitForStageLog = true;
         public string GameDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).Replace("\\Local", "\\LocalLow"), "TesseractStudio", "TaskbarHero");
         public string PlayerLogPath = "";
         public string SaveFilePath = "";
-        public string StageLogSignalText1 = "TaskbarHero.Log.LogManager:kil(LogData)";
-        public string StageLogSignalText2 = "TaskbarHero.StageManager:ihl(Int32)";
+        public string StageLogSignalText1 = "TaskbarHero.Log.LogManager:*(LogData)";
+        public string StageLogSignalText2 = "TaskbarHero.UI_Stage:*(Int32)";
         public int MaxDeferralSeconds = 1800;
         public int StageSignalSettleSeconds = 5;
         public int SaveSettleSeconds = 5;
@@ -1486,20 +1969,25 @@ namespace TaskBarHeroGuard
                 new KeyValuePair<string, string>("StartupBackWindowTitleContains", "Steam;Task Bar Hero;TaskbarHero;タスクバー ヒーロー;ゲームを起動中;起動中"),
                 new KeyValuePair<string, string>("StartupBackRequireTitleMatch", "false"),
                 new KeyValuePair<string, string>("BringGameToFrontOnStageStart", "true"),
+                new KeyValuePair<string, string>("KeepGameTopMostAfterStageStart", "true"),
                 new KeyValuePair<string, string>("StageStartFrontWaitSeconds", "300"),
                 new KeyValuePair<string, string>("StageStartFrontRetrySeconds", "8"),
-                new KeyValuePair<string, string>("StageStartLogSignalText1", "TaskbarHero.StageManager:igs(Boolean)"),
+                new KeyValuePair<string, string>("StageStartLogSignalText1", "TaskbarHero.StageManager:*(Boolean)"),
                 new KeyValuePair<string, string>("StageStartLogSignalText2", ""),
                 new KeyValuePair<string, string>("AutoCloseOfflineReward", "true"),
                 new KeyValuePair<string, string>("AutoCloseOfflineRewardDelaySeconds", "8"),
                 new KeyValuePair<string, string>("AutoCloseOfflineRewardDurationSeconds", "45"),
                 new KeyValuePair<string, string>("AutoCloseOfflineRewardIntervalMilliseconds", "1000"),
+                new KeyValuePair<string, string>("RestoreRestartWindowPosition", "true"),
+                new KeyValuePair<string, string>("RestartWindowPositionTolerancePixels", "80"),
+                new KeyValuePair<string, string>("RestoreRestartWindowPositionSeconds", "60"),
+                new KeyValuePair<string, string>("RestoreRestartWindowPositionAfterStageStartSeconds", "15"),
                 new KeyValuePair<string, string>("WaitForStageLog", "true"),
                 new KeyValuePair<string, string>("GameDataPath", "%USERPROFILE%\\AppData\\LocalLow\\TesseractStudio\\TaskbarHero"),
                 new KeyValuePair<string, string>("PlayerLogPath", ""),
                 new KeyValuePair<string, string>("SaveFilePath", ""),
-                new KeyValuePair<string, string>("StageLogSignalText1", "TaskbarHero.Log.LogManager:kil(LogData)"),
-                new KeyValuePair<string, string>("StageLogSignalText2", "TaskbarHero.StageManager:ihl(Int32)"),
+                new KeyValuePair<string, string>("StageLogSignalText1", "TaskbarHero.Log.LogManager:*(LogData)"),
+                new KeyValuePair<string, string>("StageLogSignalText2", "TaskbarHero.UI_Stage:*(Int32)"),
                 new KeyValuePair<string, string>("MaxDeferralSeconds", "1800"),
                 new KeyValuePair<string, string>("StageSignalSettleSeconds", "5"),
                 new KeyValuePair<string, string>("SaveSettleSeconds", "5"),
@@ -1637,6 +2125,10 @@ namespace TaskBarHeroGuard
             {
                 BringGameToFrontOnStageStart = ParseBool(value, BringGameToFrontOnStageStart);
             }
+            else if (normalizedKey == "keepgametopmostafterstagestart")
+            {
+                KeepGameTopMostAfterStageStart = ParseBool(value, KeepGameTopMostAfterStageStart);
+            }
             else if (normalizedKey == "stagestartfrontwaitseconds")
             {
                 StageStartFrontWaitSeconds = ParseInt(value, StageStartFrontWaitSeconds);
@@ -1668,6 +2160,22 @@ namespace TaskBarHeroGuard
             else if (normalizedKey == "autocloseofflinerewardintervalmilliseconds")
             {
                 AutoCloseOfflineRewardIntervalMilliseconds = ParseInt(value, AutoCloseOfflineRewardIntervalMilliseconds);
+            }
+            else if (normalizedKey == "restorerestartwindowposition")
+            {
+                RestoreRestartWindowPosition = ParseBool(value, RestoreRestartWindowPosition);
+            }
+            else if (normalizedKey == "restartwindowpositiontolerancepixels")
+            {
+                RestartWindowPositionTolerancePixels = ParseInt(value, RestartWindowPositionTolerancePixels);
+            }
+            else if (normalizedKey == "restorerestartwindowpositionseconds")
+            {
+                RestoreRestartWindowPositionSeconds = ParseInt(value, RestoreRestartWindowPositionSeconds);
+            }
+            else if (normalizedKey == "restorerestartwindowpositionafterstagestartseconds")
+            {
+                RestoreRestartWindowPositionAfterStageStartSeconds = ParseInt(value, RestoreRestartWindowPositionAfterStageStartSeconds);
             }
             else if (normalizedKey == "waitforstagelog")
             {
@@ -1727,6 +2235,23 @@ namespace TaskBarHeroGuard
                 LaunchUri = "steam://rungameid/3678970";
             }
 
+            // Game updates rename obfuscated StageManager methods. Migrate the old known exact
+            // signature to a structural signal that keeps the class and Boolean call contract.
+            if (StageStartLogSignalText1.Equals("TaskbarHero.StageManager:igs(Boolean)", StringComparison.Ordinal))
+            {
+                StageStartLogSignalText1 = "TaskbarHero.StageManager:*(Boolean)";
+            }
+
+            if (StageLogSignalText1.Equals("TaskbarHero.Log.LogManager:kil(LogData)", StringComparison.Ordinal))
+            {
+                StageLogSignalText1 = "TaskbarHero.Log.LogManager:*(LogData)";
+            }
+
+            if (StageLogSignalText2.Equals("TaskbarHero.StageManager:ihl(Int32)", StringComparison.Ordinal))
+            {
+                StageLogSignalText2 = "TaskbarHero.UI_Stage:*(Int32)";
+            }
+
             if (ThresholdBytes <= 0)
             {
                 ThresholdBytes = DefaultThresholdBytes;
@@ -1758,6 +2283,9 @@ namespace TaskBarHeroGuard
             AutoCloseOfflineRewardDelaySeconds = Clamp(AutoCloseOfflineRewardDelaySeconds, 0, 300);
             AutoCloseOfflineRewardDurationSeconds = Clamp(AutoCloseOfflineRewardDurationSeconds, 1, 300);
             AutoCloseOfflineRewardIntervalMilliseconds = Clamp(AutoCloseOfflineRewardIntervalMilliseconds, 250, 10000);
+            RestartWindowPositionTolerancePixels = Clamp(RestartWindowPositionTolerancePixels, 0, 2000);
+            RestoreRestartWindowPositionSeconds = Clamp(RestoreRestartWindowPositionSeconds, 1, 300);
+            RestoreRestartWindowPositionAfterStageStartSeconds = Clamp(RestoreRestartWindowPositionAfterStageStartSeconds, 0, 300);
             MaxDeferralSeconds = Clamp(MaxDeferralSeconds, 10, 86400);
             StageSignalSettleSeconds = Clamp(StageSignalSettleSeconds, 0, 3600);
             SaveSettleSeconds = Clamp(SaveSettleSeconds, 0, 3600);
